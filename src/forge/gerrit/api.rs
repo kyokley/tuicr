@@ -1,7 +1,7 @@
 //! Gerrit backend: `ForgeBackend` over the Gerrit REST API.
 //!
 //! Unlike the other forges, Gerrit ships no companion CLI, so there is nothing
-//! to shell out to. The transport is HTTPS via [`ureq`], with the same
+//! to shell out to. The transport uses [`ureq`], with the same
 //! mockable-runner shape the other backends use ([`GerritHttp`]) so the
 //! `ForgeBackend` impl is testable without a server.
 //!
@@ -117,33 +117,6 @@ impl HttpsGerrit {
         }
     }
 
-    /// Refuse to put the HTTP Basic header on a plaintext request.
-    ///
-    /// A Gerrit HTTP password is a long-lived credential that also authorizes
-    /// `git push`, and Basic auth hands it to anything on the path in a
-    /// trivially reversible encoding. There is no opt-out: a flag to send it
-    /// anyway would be a flag to leak it, and the cases that would reach for
-    /// one — a lab instance, a local container — are better served by a
-    /// tunnel, or by reading anonymously.
-    ///
-    /// This only ever fires on a `GERRIT_URL` written as `http://`, since
-    /// every other route to a base URL is normalized onto HTTPS. Anonymous
-    /// plaintext reads stay allowed: there is no credential to leak.
-    fn reject_plaintext_credentials(&self, url: &str) -> GerritHttpResult<()> {
-        if self.auth_header.is_none() || !url.starts_with("http://") {
-            return Ok(());
-        }
-        Err(GerritHttpError::Failed {
-            status: None,
-            body: format!(
-                "refusing to send {USER_ENV_VAR}/{PASSWORD_ENV_VAR} over plaintext HTTP to \
-                 {url} — a Gerrit HTTP password sent as Basic auth is readable by anything on \
-                 the path, and it authorizes `git push` too. Point {URL_ENV_VAR} at an https:// \
-                 URL, or unset {USER_ENV_VAR}/{PASSWORD_ENV_VAR} to read anonymously."
-            ),
-        })
-    }
-
     /// Attach HTTP Basic credentials, when there are any. Gerrit reads public
     /// changes anonymously, so an unauthenticated request is not an error.
     fn authorized<B>(&self, builder: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
@@ -160,7 +133,6 @@ impl GerritHttp for HttpsGerrit {
     }
 
     fn request(&self, method: &str, url: &str, body: Option<&str>) -> GerritHttpResult<String> {
-        self.reject_plaintext_credentials(url)?;
         // `ureq` gives with-body and without-body builders different types, so
         // the body-carrying methods share one arm and GET gets its own.
         let result = match method.to_ascii_uppercase().as_str() {
@@ -1655,50 +1627,109 @@ mod tests {
         }
     }
 
-    // ---- Plaintext credentials ----
+    // ---- HTTP credentials ----
 
-    #[test]
-    fn should_refuse_to_send_credentials_over_plaintext_http() {
-        // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
-        // when — no request is made; the guard fires first
-        let result = http.request(
-            "GET",
-            "http://review.internal/a/changes/?q=status:open",
-            None,
-        );
-        // then
-        let GerritHttpError::Failed { status, body } = result.expect_err("refused") else {
-            panic!("plaintext credentials should not read as an auth failure");
-        };
-        assert_eq!(status, None);
-        assert!(body.contains("plaintext HTTP"), "{body}");
-        assert!(
-            !body.contains("s3cret") && !body.contains("czNjcmV0"),
-            "the refusal must not echo the credential: {body}"
-        );
+    fn serve_one_http_request() -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("set bounded accept");
+        let address = listener.local_addr().expect("server address");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "timed out waiting for request");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set bounded read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            let mut expected_len = None;
+            loop {
+                let count = stream.read(&mut buffer).expect("read request");
+                assert_ne!(count, 0, "client closed before request completed");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .unwrap_or(0);
+                    expected_len = Some(header_end + 4 + content_len);
+                }
+                if expected_len.is_some_and(|len| request.len() >= len) {
+                    break;
+                }
+            }
+            sender
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("send captured request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("write response");
+        });
+        (format!("http://{address}/a/changes/"), receiver, server)
     }
 
     #[test]
-    fn should_allow_plaintext_when_there_are_no_credentials_to_leak() {
-        // given — anonymous reads over http:// stay usable
+    fn should_send_credentials_over_plaintext_http_for_get_and_post() {
+        let expected_auth = format!("Basic {}", BASE64.encode("dummy-user:dummy-password"));
+        for (method, body) in [("GET", None), ("POST", Some("{}"))] {
+            // given — a loopback server captures the actual wire request
+            let (url, receiver, server) = serve_one_http_request();
+            let http = HttpsGerrit::new(Some((
+                "dummy-user".to_string(),
+                "dummy-password".to_string(),
+            )));
+            // when
+            http.request(method, &url, body)
+                .expect("HTTP request succeeds");
+            server.join().expect("server completes");
+            // then
+            let request = receiver.recv().expect("captured request");
+            assert!(
+                request.lines().any(|line| {
+                    line.eq_ignore_ascii_case(&format!("authorization: {expected_auth}"))
+                }),
+                "{request}"
+            );
+            assert!(request.starts_with(&format!("{method} /a/changes/ HTTP/1.1\r\n")));
+            if let Some(body) = body {
+                assert!(request.ends_with(body), "{request}");
+            }
+        }
+    }
+
+    #[test]
+    fn should_not_send_authorization_for_anonymous_http_requests() {
+        let (url, receiver, server) = serve_one_http_request();
         let http = HttpsGerrit::new(None);
-        // when
-        let refused = http
-            .reject_plaintext_credentials("http://review.internal/changes/")
-            .is_err();
-        // then
-        assert!(!refused);
-    }
-
-    #[test]
-    fn should_allow_credentials_over_https() {
-        // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
-        // when/then
+        http.request("GET", &url, None)
+            .expect("anonymous request succeeds");
+        server.join().expect("server completes");
+        let request = receiver.recv().expect("captured request");
         assert!(
-            http.reject_plaintext_credentials("https://review.internal/a/changes/")
-                .is_ok()
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "{request}"
         );
     }
 

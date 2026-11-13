@@ -6,7 +6,7 @@ place of a pull request, and its change number is the "PR number" everywhere in 
 
 Gerrit ships no companion CLI (the other backends wrap `gh`, `glab`, `bkt`, and `az`), so tuicr
 talks to the [Gerrit REST API](https://gerrit-review.googlesource.com/Documentation/rest-api.html)
-directly over HTTPS.
+directly over HTTPS by default, or HTTP when explicitly configured.
 
 ## Setup
 
@@ -57,7 +57,7 @@ deployments a git remote cannot describe:
 | --- | --- |
 | Gerrit under a path prefix | `GERRIT_URL=https://review.internal/gerrit` |
 | REST API on a non-default port | `GERRIT_URL=https://review.internal:8443` |
-| Plain HTTP, read-only | `GERRIT_URL=http://review.internal` |
+| Plain HTTP (unencrypted, including credentials) | `GERRIT_URL=http://review.internal` |
 | Web host differs from the SSH gateway in the remote | `GERRIT_URL=https://review.corp.com` |
 
 That last row is the one you cannot express any other way: with a remote of
@@ -68,12 +68,12 @@ A value without a scheme (`review.internal`, `review.internal:8443`) or an SSH U
 dropped — that is Gerrit's *SSH* port and means nothing over HTTPS — but any other port you write
 is kept. Use the full `http://…` form if your REST API is not on HTTPS.
 
-**Plain HTTP is anonymous-only.** With `GERRIT_USERNAME`/`GERRIT_PASSWORD` set, a `GERRIT_URL` on
-`http://` is refused before the request leaves tuicr. A Gerrit HTTP password is long-lived and
-authorizes `git push` as well as the REST API, and HTTP Basic puts it on the wire in a trivially
-reversible encoding — so an `http://` server can be browsed anonymously, but not authenticated to.
-There is no override. If you need to submit reviews, put the REST API behind HTTPS or reach it
-through a tunnel.
+**Plain HTTP sends credentials without encryption.** Explicitly setting
+`GERRIT_URL=http://…` allows authenticated requests, including review submissions, with
+`GERRIT_USERNAME`/`GERRIT_PASSWORD`; no additional opt-in is required. A Gerrit HTTP password is
+long-lived and authorizes `git push` as well as the REST API. HTTP Basic uses a trivially
+reversible encoding, so anyone who can observe the connection can recover the credentials.
+Prefer HTTPS or an encrypted tunnel. Without credentials, HTTP requests remain anonymous.
 
 Note that `GERRIT_URL` is a process-global environment variable, so it names *one* server. If you
 review on two Gerrits, scope it per checkout (direnv, a shell wrapper) or leave it unset where the
@@ -177,8 +177,6 @@ will not post the inline comments twice. A second review *message* can still app
   `GERRIT_PASSWORD`.
 - **"Gerrit rejected the credentials…"** — `GERRIT_PASSWORD` must be the HTTP password from
   *Settings → HTTP Credentials*, not your account password.
-- **"refusing to send GERRIT_USERNAME/GERRIT_PASSWORD over plaintext HTTP…"** — `GERRIT_URL` is an
-  `http://` URL. Point it at HTTPS, or unset the two credential variables to browse anonymously.
 - **The Pull Requests tab says there is no supported remote** — your Gerrit host shows none of the
   three signals above. Set `GERRIT_URL` to the server root.
 - **Requests go to the wrong host** — the error names the server actually contacted. If that is
