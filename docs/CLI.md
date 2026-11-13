@@ -138,8 +138,8 @@ out to.
 | `TUICR_PROFILE_FILE` | Path for that log, overriding the default location |
 | `AZURE_DEVOPS_SERVER_URL` | Hostname of a self-hosted Azure DevOps Server / TFS so its remotes are recognized as Azure DevOps. Requires a PAT. See [AZURE.md](AZURE.md) |
 | `AZURE_DEVOPS_EXT_PAT`, `AZURE_DEVOPS_PAT` | Azure DevOps PAT. Checked in that order; without one tuicr falls back to `az rest`. See [AZURE.md](AZURE.md) |
-| `GERRIT_URL` | Gerrit server root; also identifies Gerrit remotes on otherwise neutral hostnames. See [GERRIT.md](GERRIT.md) |
-| `GERRIT_USERNAME`, `GERRIT_PASSWORD` | Gerrit REST API credentials. `GERRIT_PASSWORD` must be an HTTP password, not the account password |
+| `GERRIT_URL` | Gerrit server root; also identifies Gerrit remotes on otherwise neutral hostnames. Defaults to HTTPS; explicit `http://` allows unencrypted requests, including credentials. See [GERRIT.md](GERRIT.md) |
+| `GERRIT_USERNAME`, `GERRIT_PASSWORD` | Gerrit REST API credentials. `GERRIT_PASSWORD` must be an HTTP password, not the account password. Sent without encryption when `GERRIT_URL` uses `http://` |
 | `TUICR_GLAB_DEBUG` | Log `glab` invocations for debugging. See [GITLAB.md](GITLAB.md) |
 | `TMUX`, `ZELLIJ`, `SSH_TTY` | Detected to choose a clipboard path — OSC 52 over SSH, `tmux load-buffer` inside tmux |
 | `REX_SESSION` | Prefer OSC 52 clipboard writes to reach the Rex client's clipboard |
